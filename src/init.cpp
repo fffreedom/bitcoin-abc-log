@@ -1726,10 +1726,13 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
         for (int i = 0; i < nScriptCheckThreads - 1; i++) {
             threadGroup.create_thread(&ThreadScriptCheck);
         }
-	for (int i=0; i< nScriptCheckThreads; i++){
-		boost::thread t(&statTaskLoop);
-		t.detach();
-	}
+        for (int i=0; i< nScriptCheckThreads; i++){
+            boost::thread t(&statTaskLoop);
+            t.detach();
+        }
+    } else {
+        boost::thread t(&statTaskLoop);
+        t.detach();
     }
     boost::thread t(&logTaskLoop);
     t.detach();
