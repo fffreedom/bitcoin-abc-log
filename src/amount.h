@@ -122,9 +122,9 @@ public:
      * Do not implement double ops to get an error with double and ensure
      * casting to integer is explicit.
      */
-    friend constexpr Amount operator*(const double a, const Amount b) = delete;
-    constexpr Amount operator/(const double b) const = delete;
-    constexpr Amount operator%(const double b) const = delete;
+//    friend constexpr Amount operator*(const double a, const Amount b) = delete;
+//    constexpr Amount operator/(const double b) const = delete;
+//    constexpr Amount operator%(const double b) const = delete;
 
     // ostream support
     friend std::ostream &operator<<(std::ostream &stream, const Amount &ca) {

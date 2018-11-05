@@ -2710,7 +2710,7 @@ struct taskArg{
 	std::unique_ptr<CDBIterator> pcursor;
 };
 
-const std::size_t  qsize = 1e4;
+const std::size_t  qsize = 16;
 threadsafe_queue<taskArg, qsize>            statQueue;
 threadsafe_queue<CCoinsStats, qsize>        logQueue;
 
@@ -2725,6 +2725,7 @@ static bool GetUTXOStats(taskArg  arg) {
 
     ss << stats.hashBlock;
     pcursor->Seek('C');
+    int i = 0;
     while (pcursor->Valid()) {
         boost::this_thread::interruption_point();
         if (pcursor->GetK(key) && pcursor->GetV(val)) {
@@ -2734,11 +2735,12 @@ static bool GetUTXOStats(taskArg  arg) {
             return error("%s: unable to read value", __func__);
         }
         pcursor->Next();
+        i++;
     }
     //int64_t e = GetTimeMicros();
-    //LogPrint(BCLog::BENCH, "- iter utxo leveldb: %.2fms\n",(e-b ) * 0.001);
+    LogPrint(BCLog::BENCH, "Height:%d, data count:%d", stats.nHeight, i);
     stats.hashSerialized = ss.GetHash();
-    logQueue.push(std::move(stats));
+    logQueue.wait_and_push(std::move(stats));
     return true;
 }
 
@@ -2765,7 +2767,7 @@ void logTaskLoop(){
           LogPrintf("failed open utxo.log\n");
           return ;
       }
-      CAutoFile logf{fileout, 0, 0};
+      CAutoFile logfile{fileout, 0, 0};
 
       for(;;){
 	     if(netClosed() && logQueue.empty()) {
@@ -2776,7 +2778,7 @@ void logTaskLoop(){
 	      auto line = stats.ToString();
 
 	      try {
-		      logf.write(line.c_str(), line.size());
+		      logfile.write(line.c_str(), line.size());
 	      } catch (const std::ios_base::failure &e) {
 		      LogPrintf("wirte utxo.log failed:%s\n", e.what());
 		      return ;
@@ -2849,23 +2851,25 @@ static bool ConnectTip(const Config &config, CValidationState &state,
     LogPrint(BCLog::BENCH, "  - Writing chainstate: %.2fms [%.2fs]\n",
              (nTime5 - nTime4) * 0.001, nTimeChainState * 0.000001);
 
-  if (pindexNew->nHeight > 0) {
-    auto  coindbCatcher = dynamic_cast<CCoinsViewBacked*>(pcoinsTip->GetBackend()); 
-    auto  pcoinsdbview = dynamic_cast<CCoinsViewDB*> (coindbCatcher->GetBackend());
-    assert(pcoinsdbview != nullptr);
-    auto&  dbw = pcoinsdbview->GetDBW();
-    std::unique_ptr<CDBIterator> pcursor (dbw.NewIterator());
+    int64_t utxoHashStartHeight = gArgs.GetArg("-utxohashstartheight", DEFAULT_UTXO_HASH_START_HEIGHT);
+    if (utxoHashStartHeight >= 0 && pindexNew->nHeight >= utxoHashStartHeight) {
+    //if (pindexNew->nHeight > 0) {
+        auto  coindbCatcher = dynamic_cast<CCoinsViewBacked*>(pcoinsTip->GetBackend());
+        auto  pcoinsdbview = dynamic_cast<CCoinsViewDB*> (coindbCatcher->GetBackend());
+        assert(pcoinsdbview != nullptr);
+        auto&  dbw = pcoinsdbview->GetDBW();
+        std::unique_ptr<CDBIterator> pcursor (dbw.NewIterator());
 
-    CCoinsStats stats;
-    stats.hashBlock = pcoinsdbview->GetBestBlock();
-    stats.nHeight = mapBlockIndex.find(stats.hashBlock)->second->nHeight;
-    statQueue.wait_and_push(taskArg(std::move(stats), std::move(pcursor)));
+        CCoinsStats stats;
+        stats.hashBlock = pcoinsdbview->GetBestBlock();
+        stats.nHeight = mapBlockIndex.find(stats.hashBlock)->second->nHeight;
+        statQueue.wait_and_push(taskArg(std::move(stats), std::move(pcursor)));
 
-    int64_t nTime6 = GetTimeMicros();
-    nTimeUtxoStat += nTime6 -nTime5;
-    LogPrint(BCLog::BENCH, " push utxo stats: %.2fms [%.2fs]\n",
+        int64_t nTime6 = GetTimeMicros();
+        nTimeUtxoStat += nTime6 -nTime5;
+        LogPrint(BCLog::BENCH, " push utxo stats: %.2fms [%.2fs]\n",
            (nTime6 - nTime5) * 0.001,  nTimeUtxoStat * 0.000001);
-  }
+    }
 
     // Remove conflicting transactions from the mempool.;
     mempool.removeForBlock(blockConnecting.vtx, pindexNew->nHeight);
