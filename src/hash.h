@@ -41,6 +41,28 @@ public:
         return *this;
     }
 };
+/** A hasher class for Bitcoin's 256-bit hash (single SHA-256). */
+class CSingleHash256 {
+private:
+    CSHA256 sha;
+
+public:
+    static const size_t OUTPUT_SIZE = CSHA256::OUTPUT_SIZE;
+
+    void Finalize(uint8_t hash[OUTPUT_SIZE]) {
+        sha.Finalize(hash);
+    }
+
+    CSingleHash256 &Write(const uint8_t *data, size_t len) {
+        sha.Write(data, len);
+        return *this;
+    }
+
+    CSingleHash256 &Reset() {
+        sha.Reset();
+        return *this;
+    }
+};
 
 /** A hasher class for Bitcoin's 160-bit hash (SHA-256 + RIPEMD-160). */
 class CHash160 {
@@ -165,6 +187,39 @@ public:
     }
 };
 
+/** A writer stream (for serialization) that computes a single 256-bit hash. */
+class CSingleHashWriter {
+private:
+    CSingleHash256 ctx;
+
+    const int nType;
+    const int nVersion;
+
+public:
+    CSingleHashWriter(int nTypeIn, int nVersionIn)
+        : nType(nTypeIn), nVersion(nVersionIn) {}
+
+    int GetType() const { return nType; }
+    int GetVersion() const { return nVersion; }
+
+    void write(const char *pch, size_t size) {
+        ctx.Write((const uint8_t *)pch, size);
+    }
+
+    // invalidates the object
+    uint256 GetHash() {
+        uint256 result;
+        ctx.Finalize((uint8_t *)&result);
+        return result;
+    }
+
+    template <typename T> CSingleHashWriter &operator<<(const T &obj) {
+        // Serialize to this stream
+        ::Serialize(*this, obj);
+        return (*this);
+    }
+};
+
 /**
  * Reads data from an underlying stream, while hashing the read data.
  */
@@ -207,10 +262,10 @@ uint256 SerializeHash(const T &obj, int nType = SER_GETHASH,
     return ss.GetHash();
 }
 
-unsigned int MurmurHash3(unsigned int nHashSeed,
-                         const std::vector<uint8_t> &vDataToHash);
+uint32_t MurmurHash3(uint32_t nHashSeed,
+                     const std::vector<uint8_t> &vDataToHash);
 
-void BIP32Hash(const ChainCode &chainCode, unsigned int nChild, uint8_t header,
+void BIP32Hash(const ChainCode &chainCode, uint32_t nChild, uint8_t header,
                const uint8_t data[32], uint8_t output[64]);
 
 /** SipHash-2-4 */

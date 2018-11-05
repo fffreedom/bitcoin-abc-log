@@ -49,7 +49,9 @@
 #include <boost/math/distributions/poisson.hpp>
 #include <boost/range/adaptor/reversed.hpp>
 #include <boost/thread.hpp>
-
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 #if defined(NDEBUG)
 #error "Bitcoin cannot be compiled without assertions."
 #endif
@@ -513,21 +515,6 @@ bool CheckRegularTransaction(const CTransaction &tx, CValidationState &state,
     return true;
 }
 
-static void LimitMempoolSize(CTxMemPool &pool, size_t limit,
-                             unsigned long age) {
-    int expired = pool.Expire(GetTime() - age);
-    if (expired != 0) {
-        LogPrint(BCLog::MEMPOOL,
-                 "Expired %i transactions from the memory pool\n", expired);
-    }
-
-    std::vector<COutPoint> vNoSpendsRemaining;
-    pool.TrimToSize(limit, &vNoSpendsRemaining);
-    for (const COutPoint &removed : vNoSpendsRemaining) {
-        pcoinsTip->Uncache(removed);
-    }
-}
-
 /** Convert CValidationState to a human-readable message for logging */
 std::string FormatStateMessage(const CValidationState &state) {
     return strprintf(
@@ -606,10 +593,10 @@ static bool IsMagneticAnomalyEnabledForCurrentBlock(const Config &config) {
 // <timestamp>. Defaults to the pre-defined timestamp when not set.
 static bool IsReplayProtectionEnabled(const Config &config,
                                       int64_t nMedianTimePast) {
-    return nMedianTimePast >= gArgs.GetArg("-replayprotectionactivationtime",
-                                           config.GetChainParams()
-                                               .GetConsensus()
-                                               .greatWallActivationTime);
+    return nMedianTimePast >=
+           gArgs.GetArg(
+               "-replayprotectionactivationtime",
+               config.GetChainParams().GetConsensus().greatWallActivationTime);
 }
 
 static bool IsReplayProtectionEnabled(const Config &config,
@@ -624,64 +611,6 @@ static bool IsReplayProtectionEnabled(const Config &config,
 static bool IsReplayProtectionEnabledForCurrentBlock(const Config &config) {
     AssertLockHeld(cs_main);
     return IsReplayProtectionEnabled(config, chainActive.Tip());
-}
-
-/**
- * Make mempool consistent after a reorg, by re-adding or recursively erasing
- * disconnected block transactions from the mempool, and also removing any other
- * transactions from the mempool that are no longer valid given the new
- * tip/height.
- *
- * Note: we assume that disconnectpool only contains transactions that are NOT
- * confirmed in the current chain nor already in the mempool (otherwise,
- * in-mempool descendants of such transactions would be removed).
- *
- * Passing fAddToMempool=false will skip trying to add the transactions back,
- * and instead just erase from the mempool as needed.
- */
-void UpdateMempoolForReorg(const Config &config,
-                           DisconnectedBlockTransactions &disconnectpool,
-                           bool fAddToMempool) {
-    AssertLockHeld(cs_main);
-    std::vector<uint256> vHashUpdate;
-    // disconnectpool's insertion_order index sorts the entries from oldest to
-    // newest, but the oldest entry will be the last tx from the latest mined
-    // block that was disconnected.
-    // Iterate disconnectpool in reverse, so that we add transactions back to
-    // the mempool starting with the earliest transaction that had been
-    // previously seen in a block.
-    auto it = disconnectpool.queuedTx.get<insertion_order>().rbegin();
-    while (it != disconnectpool.queuedTx.get<insertion_order>().rend()) {
-        // ignore validation errors in resurrected transactions
-        CValidationState stateDummy;
-        if (!fAddToMempool || (*it)->IsCoinBase() ||
-            !AcceptToMemoryPool(config, mempool, stateDummy, *it, false,
-                                nullptr, true)) {
-            // If the transaction doesn't make it in to the mempool, remove any
-            // transactions that depend on it (which would now be orphans).
-            mempool.removeRecursive(**it, MemPoolRemovalReason::REORG);
-        } else if (mempool.exists((*it)->GetId())) {
-            vHashUpdate.push_back((*it)->GetId());
-        }
-        ++it;
-    }
-
-    disconnectpool.queuedTx.clear();
-    // AcceptToMemoryPool/addUnchecked all assume that new mempool entries have
-    // no in-mempool children, which is generally not true when adding
-    // previously-confirmed transactions back to the mempool.
-    // UpdateTransactionsFromBlock finds descendants of any transactions in the
-    // disconnectpool that were added back and cleans up the mempool state.
-    mempool.UpdateTransactionsFromBlock(vHashUpdate);
-
-    // We also need to remove any now-immature transactions
-    mempool.removeForReorg(config, pcoinsTip, chainActive.Tip()->nHeight + 1,
-                           STANDARD_LOCKTIME_VERIFY_FLAGS);
-    // Re-limit mempool size, in case we added any transactions
-    LimitMempoolSize(
-        mempool,
-        gArgs.GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000,
-        gArgs.GetArg("-mempoolexpiry", DEFAULT_MEMPOOL_EXPIRY) * 60 * 60);
 }
 
 // Used to avoid mempool polluting consensus critical paths if CCoinsViewMempool
@@ -1061,8 +990,7 @@ static bool AcceptToMemoryPoolWorker(
 
         // Trim mempool and check if tx was trimmed.
         if (!fOverrideMempoolLimit) {
-            LimitMempoolSize(
-                pool,
+            pool.LimitSize(
                 gArgs.GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000,
                 gArgs.GetArg("-mempoolexpiry", DEFAULT_MEMPOOL_EXPIRY) * 60 *
                     60);
@@ -1264,7 +1192,7 @@ Amount GetBlockSubsidy(int nHeight, const Consensus::Params &consensusParams) {
     Amount nSubsidy = 50 * COIN;
     // Subsidy is cut in half every 210,000 blocks which will occur
     // approximately every 4 years.
-    return Amount(nSubsidy.GetSatoshis() >> halvings);
+    return Amount((nSubsidy / SATOSHI) >> halvings);
 }
 
 bool IsInitialBlockDownload() {
@@ -1817,7 +1745,7 @@ DisconnectResult ApplyBlockUndo(const CBlockUndo &blockUndo,
     // Second, revert created outputs.
     for (const auto &ptx : block.vtx) {
         const CTransaction &tx = *ptx;
-        uint256 txid = tx.GetId();
+        const TxId &txid = tx.GetId();
 
         // Check that all outputs are available and match the outputs in the
         // block itself exactly.
@@ -2539,7 +2467,7 @@ static void UpdateTip(const Config &config, CBlockIndex *pindexNew) {
  * Disconnect chainActive's tip.
  * After calling, the mempool will be in an inconsistent state, with
  * transactions from disconnected blocks being added to disconnectpool. You
- * should make the mempool consistent again by calling UpdateMempoolForReorg.
+ * should make the mempool consistent again by calling updateMempoolForReorg.
  * with cs_main held.
  *
  * If disconnectpool is nullptr, then no disconnected transactions are added to
@@ -2605,18 +2533,7 @@ static bool DisconnectTip(const Config &config, CValidationState &state,
     }
 
     if (disconnectpool) {
-        // Save transactions to re-add to mempool at end of reorg
-        for (const auto &tx : boost::adaptors::reverse(block.vtx)) {
-            disconnectpool->addTransaction(tx);
-        }
-        while (disconnectpool->DynamicMemoryUsage() >
-               MAX_DISCONNECTED_TX_POOL_SIZE) {
-            // Drop the earliest entry, and remove its children from the
-            // mempool.
-            auto it = disconnectpool->queuedTx.get<insertion_order>().begin();
-            mempool.removeRecursive(**it, MemPoolRemovalReason::REORG);
-            disconnectpool->removeEntry(it);
-        }
+        disconnectpool->addForBlock(block.vtx);
     }
 
     // Update chainActive and related variables.
@@ -2632,6 +2549,7 @@ static int64_t nTimeConnectTotal = 0;
 static int64_t nTimeFlush = 0;
 static int64_t nTimeChainState = 0;
 static int64_t nTimePostConnect = 0;
+static int64_t nTimeUtxoStat  = 0;
 
 struct PerBlockConnectTrace {
     CBlockIndex *pindex = nullptr;
@@ -2705,14 +2623,167 @@ public:
     }
 };
 
-/**
- * Connect a new block to chainActive. pblock is either nullptr or a pointer to
- * a CBlock corresponding to pindexNew, to bypass loading it again from disk.
- *
- * The block is always added to connectTrace (either after loading from disk or
- * by copying pblock) - if that is not intended, care must be taken to remove
- * the last entry in blocksConnected in case of failure.
- */
+
+static std::atomic<bool> fNetClose{false};
+void setNetClose(){
+	fNetClose = true;
+}
+bool netClosed(){
+	return fNetClose;
+}
+
+namespace {
+template<typename T, std::size_t max>
+class threadsafe_queue
+{
+private:
+    mutable std::mutex mut;
+    std::queue<T> data_queue;
+    std::condition_variable full_cond;
+    std::condition_variable empty_cond;
+public:
+    threadsafe_queue(){}
+
+    void push(T new_value)
+    {
+        std::lock_guard<std::mutex> lk(mut);
+        data_queue.push(std::move(new_value));
+        empty_cond.notify_one();
+    }
+
+    void wait_and_push(T value){
+        std::unique_lock<std::mutex> lk(mut);
+        full_cond.wait(lk, [this]{return data_queue.size() < max; });
+        data_queue.push(std::move(value));
+        empty_cond.notify_one();
+    }
+
+    void wait_and_pop(T& value)
+    {
+        std::unique_lock<std::mutex> lk(mut);
+        empty_cond.wait(lk, [this]{return !data_queue.empty();});
+        value=std::move(data_queue.front());
+        data_queue.pop();
+	full_cond.notify_one();
+    }
+    
+    bool try_pop(T& value)
+    {
+        std::lock_guard<std::mutex> lk(mut);
+        if(data_queue.empty())
+            return false;
+        value=std::move(data_queue.front());
+        data_queue.pop();
+    }
+
+    bool empty() const
+    {
+        std::lock_guard<std::mutex> lk(mut);
+        return data_queue.empty();
+    }
+
+    std::size_t size() const {
+        std::lock_guard<std::mutex> lk(mut);
+        return data_queue.size();
+    }
+};
+
+struct CCoinsStats {
+    int nHeight;
+    uint256 hashBlock;
+    uint256 hashSerialized;
+
+    CCoinsStats()
+        : nHeight(0){}
+
+    std::string ToString() const {
+        return strprintf("height=%d,bestblock=%s,hash_serialized=%s\n",
+                         nHeight, hashBlock.GetHex(), hashSerialized.GetHex());
+    }
+};
+
+struct taskArg{
+	taskArg(CCoinsStats s, std::unique_ptr<CDBIterator> p):
+		stats(std::move(s)), pcursor(std::move(p)) {}
+	taskArg() = default;
+	CCoinsStats stats;
+	std::unique_ptr<CDBIterator> pcursor;
+};
+
+const std::size_t  qsize = 1e4;
+threadsafe_queue<taskArg, qsize>            statQueue;
+threadsafe_queue<CCoinsStats, qsize>        logQueue;
+
+static bool GetUTXOStats(taskArg  arg) {
+    CSingleHashWriter ss(SER_GETHASH, PROTOCOL_VERSION);
+    std::vector<char>  key;
+    std::vector<char>  val;
+
+    //int64_t b = GetTimeMicros();
+    auto stats = std::move(arg.stats);
+    auto pcursor = std::move(arg.pcursor);
+
+    ss << stats.hashBlock;
+    pcursor->Seek('C');
+    while (pcursor->Valid()) {
+        boost::this_thread::interruption_point();
+        if (pcursor->GetK(key) && pcursor->GetV(val)) {
+		ss << CFlatData(key);
+		ss << CFlatData(val);
+        } else {
+            return error("%s: unable to read value", __func__);
+        }
+        pcursor->Next();
+    }
+    //int64_t e = GetTimeMicros();
+    //LogPrint(BCLog::BENCH, "- iter utxo leveldb: %.2fms\n",(e-b ) * 0.001);
+    stats.hashSerialized = ss.GetHash();
+    logQueue.push(std::move(stats));
+    return true;
+}
+
+} // utxo stats namespace
+
+
+void statTaskLoop(){
+        RenameThread("utxo-stat");
+	for(;;){
+		if(netClosed() && statQueue.empty()) {
+				break;
+		} 
+		
+		taskArg arg;
+		statQueue.wait_and_pop(arg);
+		GetUTXOStats(std::move(arg));
+	}
+}
+
+void logTaskLoop(){
+      RenameThread("utxo-log");
+      FILE *fileout = fsbridge::fopen(GetDataDir() / "utxo.log", "a");
+      if (!fileout) {
+          LogPrintf("failed open utxo.log\n");
+          return ;
+      }
+      CAutoFile logf{fileout, 0, 0};
+
+      for(;;){
+	     if(netClosed() && logQueue.empty()) {
+				break;
+	      } 
+	      CCoinsStats stats;
+	      logQueue.wait_and_pop(stats);
+	      auto line = stats.ToString();
+
+	      try {
+		      logf.write(line.c_str(), line.size());
+	      } catch (const std::ios_base::failure &e) {
+		      LogPrintf("wirte utxo.log failed:%s\n", e.what());
+		      return ;
+	      }
+      }
+}
+
 static bool ConnectTip(const Config &config, CValidationState &state,
                        CBlockIndex *pindexNew,
                        const std::shared_ptr<const CBlock> &pblock,
@@ -2769,7 +2840,7 @@ static bool ConnectTip(const Config &config, CValidationState &state,
 
     // Write the chain state to disk, if necessary.
     if (!FlushStateToDisk(config.GetChainParams(), state,
-                          FLUSH_STATE_IF_NEEDED)) {
+                          FLUSH_STATE_ALWAYS)) {
         return false;
     }
 
@@ -2777,6 +2848,24 @@ static bool ConnectTip(const Config &config, CValidationState &state,
     nTimeChainState += nTime5 - nTime4;
     LogPrint(BCLog::BENCH, "  - Writing chainstate: %.2fms [%.2fs]\n",
              (nTime5 - nTime4) * 0.001, nTimeChainState * 0.000001);
+
+  if (pindexNew->nHeight > 0) {
+    auto  coindbCatcher = dynamic_cast<CCoinsViewBacked*>(pcoinsTip->GetBackend()); 
+    auto  pcoinsdbview = dynamic_cast<CCoinsViewDB*> (coindbCatcher->GetBackend());
+    assert(pcoinsdbview != nullptr);
+    auto&  dbw = pcoinsdbview->GetDBW();
+    std::unique_ptr<CDBIterator> pcursor (dbw.NewIterator());
+
+    CCoinsStats stats;
+    stats.hashBlock = pcoinsdbview->GetBestBlock();
+    stats.nHeight = mapBlockIndex.find(stats.hashBlock)->second->nHeight;
+    statQueue.wait_and_push(taskArg(std::move(stats), std::move(pcursor)));
+
+    int64_t nTime6 = GetTimeMicros();
+    nTimeUtxoStat += nTime6 -nTime5;
+    LogPrint(BCLog::BENCH, " push utxo stats: %.2fms [%.2fs]\n",
+           (nTime6 - nTime5) * 0.001,  nTimeUtxoStat * 0.000001);
+  }
 
     // Remove conflicting transactions from the mempool.;
     mempool.removeForBlock(blockConnecting.vtx, pindexNew->nHeight);
@@ -2908,7 +2997,7 @@ static bool ActivateBestChainStep(const Config &config, CValidationState &state,
         if (!DisconnectTip(config, state, &disconnectpool)) {
             // This is likely a fatal error, but keep the mempool consistent,
             // just in case. Only remove from the mempool in this case.
-            UpdateMempoolForReorg(config, disconnectpool, false);
+            disconnectpool.updateMempoolForReorg(config, false);
             return false;
         }
 
@@ -2956,7 +3045,7 @@ static bool ActivateBestChainStep(const Config &config, CValidationState &state,
                 // A system error occurred (disk space, database error, ...).
                 // Make the mempool consistent with the current tip, just in
                 // case any observers try to use it before shutdown.
-                UpdateMempoolForReorg(config, disconnectpool, false);
+                disconnectpool.updateMempoolForReorg(config, false);
                 return false;
             } else {
                 PruneBlockIndexCandidates();
@@ -2974,8 +3063,9 @@ static bool ActivateBestChainStep(const Config &config, CValidationState &state,
     if (fBlocksDisconnected) {
         // If any blocks were disconnected, disconnectpool may be non empty. Add
         // any disconnected transactions back to the mempool.
-        UpdateMempoolForReorg(config, disconnectpool, true);
+        disconnectpool.updateMempoolForReorg(config, true);
     }
+
     mempool.check(pcoinsTip);
 
     // Callbacks/notifications for a new best chain.
@@ -3158,14 +3248,14 @@ bool InvalidateBlock(const Config &config, CValidationState &state,
         if (!DisconnectTip(config, state, &disconnectpool)) {
             // It's probably hopeless to try to make the mempool consistent
             // here if DisconnectTip failed, but we can try.
-            UpdateMempoolForReorg(config, disconnectpool, false);
+            disconnectpool.updateMempoolForReorg(config, false);
             return false;
         }
     }
 
     // DisconnectTip will add transactions to disconnectpool; try to add these
     // back to the mempool.
-    UpdateMempoolForReorg(config, disconnectpool, true);
+    disconnectpool.updateMempoolForReorg(config, true);
 
     // The resulting new best tip may not be in setBlockIndexCandidates anymore,
     // so add it again.

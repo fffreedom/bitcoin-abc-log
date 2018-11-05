@@ -202,6 +202,7 @@ void Shutdown() {
     UnregisterValidationInterface(peerLogic.get());
     peerLogic.reset();
     g_connman.reset();
+    setNetClose();
 
     StopTorControl();
     UnregisterNodeSignals(GetNodeSignals());
@@ -1725,7 +1726,14 @@ bool AppInitMain(Config &config, boost::thread_group &threadGroup,
         for (int i = 0; i < nScriptCheckThreads - 1; i++) {
             threadGroup.create_thread(&ThreadScriptCheck);
         }
+	for (int i=0; i< nScriptCheckThreads; i++){
+		boost::thread t(&statTaskLoop);
+		t.detach();
+	}
     }
+    boost::thread t(&logTaskLoop);
+    t.detach();
+    
 
     // Start the lightweight task scheduler thread
     CScheduler::Function serviceLoop =

@@ -202,6 +202,7 @@ void CDBIterator::Next() {
     piter->Next();
 }
 
+
 namespace dbwrapper_private {
 
 void HandleError(const leveldb::Status &status) {

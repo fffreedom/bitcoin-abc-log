@@ -6,6 +6,7 @@
 #ifndef BITCOIN_TXDB_H
 #define BITCOIN_TXDB_H
 
+#include "blockfileinfo.h"
 #include "chain.h"
 #include "coins.h"
 #include "dbwrapper.h"
@@ -69,6 +70,10 @@ protected:
 
 public:
     CCoinsViewDB(size_t nCacheSize, bool fMemory = false, bool fWipe = false);
+    CDBWrapper& GetDBW() {
+	    return  db;
+    }
+
 
     bool GetCoin(const COutPoint &outpoint, Coin &coin) const override;
     bool HaveCoin(const COutPoint &outpoint) const override;
